@@ -1,6 +1,8 @@
 require 'rake'
 require 'rake/sprocketstask'
 require 'sprockets'
+require 'action_view'
+require 'action_view/base'
 
 module Sprockets
   module Rails
@@ -14,7 +16,9 @@ module Sprockets
 
       def environment
         if app
-          app.assets
+          # Use initialized app.assets or force build an environment if
+          # config.assets.compile is disabled
+          app.assets || Sprockets::Railtie.build_environment(app)
         else
           super
         end
@@ -22,7 +26,8 @@ module Sprockets
 
       def output
         if app
-          File.join(app.root, 'public', app.config.assets.prefix)
+          config = app.config
+          File.join(config.paths['public'].first, config.assets.prefix)
         else
           super
         end
@@ -36,17 +41,20 @@ module Sprockets
         end
       end
 
-      def cache_path
+      def manifest
         if app
-          "#{app.config.root}/tmp/cache/assets"
+          Sprockets::Manifest.new(index, output, app.config.assets.manifest)
         else
-          @cache_path
+          super
         end
       end
-      attr_writer :cache_path
 
       def define
         namespace :assets do
+          %w( environment precompile clean clobber ).each do |task|
+            Rake::Task[task].clear if Rake::Task.task_defined?(task)
+          end
+
           # Override this task change the loaded dependencies
           desc "Load asset compile environment"
           task :environment do
@@ -63,9 +71,8 @@ module Sprockets
 
           desc "Remove old compiled assets"
           task :clean, [:keep] => :environment do |t, args|
-            keep = Integer(Array.wrap(args[:keep]).first || 2)
             with_logger do
-              manifest.clean(keep)
+              manifest.clean(Integer(Array.wrap(args[:keep]).first || self.keep))
             end
           end
 
@@ -73,7 +80,6 @@ module Sprockets
           task :clobber => :environment do
             with_logger do
               manifest.clobber
-              rm_rf cache_path if cache_path
             end
           end
         end

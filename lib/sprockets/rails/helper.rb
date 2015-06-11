@@ -5,58 +5,62 @@ require 'active_support/core_ext/class/attribute'
 module Sprockets
   module Rails
     module Helper
-      if defined? ActionView::Helpers::AssetUrlHelper
-        include ActionView::Helpers::AssetUrlHelper
-        include ActionView::Helpers::AssetTagHelper
-      else
-        require 'sprockets/rails/legacy_asset_tag_helper'
-        require 'sprockets/rails/legacy_asset_url_helper'
-        include LegacyAssetTagHelper
-        include LegacyAssetUrlHelper
+      class AssetNotPrecompiled < StandardError
+        def initialize(source)
+          msg = "Asset was not declared to be precompiled in production.\n" +
+                "Add `Rails.application.config.assets.precompile += " +
+                "%w( #{source} )` to `config/initializers/assets.rb` and " +
+                "restart your server"
+          super(msg)
+        end
       end
 
+      include ActionView::Helpers::AssetUrlHelper
+      include ActionView::Helpers::AssetTagHelper
+
       VIEW_ACCESSORS = [:assets_environment, :assets_manifest,
+                        :assets_precompile,
                         :assets_prefix, :digest_assets, :debug_assets]
 
       def self.included(klass)
-        if klass < Sprockets::Context
-          klass.class_eval do
-            alias_method :assets_environment, :environment
-            def assets_manifest; end
-            class_attribute :config, :assets_prefix, :digest_assets, :debug_assets
+        klass.class_attribute(*VIEW_ACCESSORS)
+
+        klass.class_eval do
+          remove_method :assets_environment
+          def assets_environment
+            if instance_variable_defined?(:@assets_environment)
+              @assets_environment = @assets_environment.cached
+            elsif env = self.class.assets_environment
+              @assets_environment = env.cached
+            else
+              nil
+            end
           end
-        else
-          klass.class_attribute(*VIEW_ACCESSORS)
         end
       end
 
       def self.extended(obj)
         obj.class_eval do
           attr_accessor(*VIEW_ACCESSORS)
+
+          remove_method :assets_environment
+          def assets_environment
+            if env = @assets_environment
+              @assets_environment = env.cached
+            else
+              nil
+            end
+          end
         end
       end
 
       def compute_asset_path(path, options = {})
-        if digest_path = asset_digest_path(path)
+        if digest_path = asset_digest_path(path, options)
           path = digest_path if digest_assets
           path += "?body=1" if options[:debug]
           File.join(assets_prefix || "/", path)
         else
           super
-        end
-      end
-
-      # Get digest for asset path.
-      #
-      # path    - String path
-      # options - Hash options
-      #
-      # Returns String Hex digest or nil if digests are disabled.
-      def asset_digest(path, options = {})
-        return unless digest_assets
-
-        if digest_path = asset_digest_path(path, options)
-          digest_path[/-(.+)\./, 1]
         end
       end
 
@@ -75,9 +79,43 @@ module Sprockets
 
         if environment = assets_environment
           if asset = environment[path]
+            unless options[:debug]
+              if !precompiled_assets.include?(asset)
+                raise AssetNotPrecompiled.new(asset.logical_path)
+              end
+            end
             return asset.digest_path
           end
         end
+      end
+
+      # Experimental: Get integrity for asset path.
+      #
+      # path    - String path
+      # options - Hash options
+      #
+      # Returns String integrity attribute or nil if no asset was found.
+      def asset_integrity(path, options = {})
+        path = path.to_s
+        if extname = compute_asset_extname(path, options)
+          path = "#{path}#{extname}"
+        end
+
+        if manifest = assets_manifest
+          if digest_path = manifest.assets[path]
+            if metadata = manifest.files[digest_path]
+              return metadata["integrity"]
+            end
+          end
+        end
+
+        if environment = assets_environment
+          if asset = environment[path]
+            return asset.integrity
+          end
+        end
+
+        nil
       end
 
       # Override javascript tag helper to provide debugging support.
@@ -85,6 +123,15 @@ module Sprockets
       # Eventually will be deprecated and replaced by source maps.
       def javascript_include_tag(*sources)
         options = sources.extract_options!.stringify_keys
+
+        unless request_ssl?
+          options.delete("integrity")
+        end
+
+        case options["integrity"]
+        when true, false, nil
+          compute_integrity = options.delete("integrity")
+        end
 
         if options["debug"] != false && request_debug_assets?
           sources.map { |source|
@@ -97,8 +144,11 @@ module Sprockets
             end
           }.flatten.uniq.join("\n").html_safe
         else
-          sources.push(options)
-          super(*sources)
+          sources.map { |source|
+            super(source, compute_integrity ?
+              options.merge("integrity" => asset_integrity(source, :type => :javascript)) :
+              options)
+          }.join("\n").html_safe
         end
       end
 
@@ -107,6 +157,15 @@ module Sprockets
       # Eventually will be deprecated and replaced by source maps.
       def stylesheet_link_tag(*sources)
         options = sources.extract_options!.stringify_keys
+
+        unless request_ssl?
+          options.delete("integrity")
+        end
+
+        case options["integrity"]
+        when true, false, nil
+          compute_integrity = options.delete("integrity")
+        end
 
         if options["debug"] != false && request_debug_assets?
           sources.map { |source|
@@ -119,12 +178,19 @@ module Sprockets
             end
           }.flatten.uniq.join("\n").html_safe
         else
-          sources.push(options)
-          super(*sources)
+          sources.map { |source|
+            super(source, compute_integrity ?
+              options.merge("integrity" => asset_integrity(source, :type => :stylesheet)) :
+              options)
+          }.join("\n").html_safe
         end
       end
 
       protected
+        def request_ssl?
+          respond_to?(:request) && self.request && self.request.ssl?
+        end
+
         # Enable split asset debugging. Eventually will be deprecated
         # and replaced by source maps in Sprockets 3.x.
         def request_debug_assets?
@@ -141,7 +207,44 @@ module Sprockets
           if extname = compute_asset_extname(path, options)
             path = "#{path}#{extname}"
           end
-          env[path]
+
+          if asset = env[path]
+            if !precompiled_assets.include?(asset)
+              raise AssetNotPrecompiled.new(asset.logical_path)
+            end
+          end
+
+          asset
+        end
+
+        # Internal: Generate a Set of all precompiled assets.
+        def precompiled_assets
+          @precompiled_assets ||= begin
+            assets = Set.new
+
+            paths, filters = (assets_precompile || []).flatten.partition { |arg| Sprockets::Manifest.simple_logical_path?(arg) }
+            filters = filters.map { |arg| Sprockets::Manifest.compile_match_filter(arg) }
+
+            env = assets_environment.cached
+
+            paths.each do |path|
+              env.find_all_linked_assets(path) do |asset|
+                assets << asset
+              end
+            end
+
+            if filters.any?
+              env.logical_paths do |logical_path, filename|
+                if filters.any? { |f| f.call(logical_path, filename) }
+                  env.find_all_linked_assets(filename) do |asset|
+                    assets << asset
+                  end
+                end
+              end
+            end
+
+            assets
+          end
         end
     end
   end
